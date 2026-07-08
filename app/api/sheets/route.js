@@ -1,5 +1,9 @@
 import Papa from 'papaparse';
 import { NextResponse } from 'next/server';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import crypto from 'crypto';
 
 // Force dynamic rendering so Next.js never serves this route from the static cache.
 export const dynamic = 'force-dynamic';
@@ -7,6 +11,37 @@ export const dynamic = 'force-dynamic';
 // In-memory cache for sheet data
 const cache = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+function getCacheFilePath(url) {
+    const hash = crypto.createHash('md5').update(url).digest('hex');
+    return path.join(os.tmpdir(), `sheet-cache-${hash}.json`);
+}
+
+function readCacheFile(url) {
+    try {
+        const filePath = getCacheFilePath(url);
+        if (fs.existsSync(filePath)) {
+            const stats = fs.statSync(filePath);
+            const now = Date.now();
+            if (now - stats.mtimeMs < CACHE_TTL_MS) {
+                const content = fs.readFileSync(filePath, 'utf8');
+                return JSON.parse(content);
+            }
+        }
+    } catch (err) {
+        console.error('Error reading file cache:', err);
+    }
+    return null;
+}
+
+function writeCacheFile(url, data) {
+    try {
+        const filePath = getCacheFilePath(url);
+        fs.writeFileSync(filePath, JSON.stringify(data), 'utf8');
+    } catch (err) {
+        console.error('Error writing file cache:', err);
+    }
+}
 
 export async function GET(request) {
     const { searchParams } = new URL(request.url);
@@ -18,16 +53,33 @@ export async function GET(request) {
     }
 
     const now = Date.now();
+    let cachedEntry = null;
+
+    if (cache.has(sheetUrl)) {
+        cachedEntry = cache.get(sheetUrl);
+    }
 
     // Check memory cache if not bypassing
-    if (!bypassCache && cache.has(sheetUrl)) {
-        const cachedEntry = cache.get(sheetUrl);
-        if (now - cachedEntry.timestamp < CACHE_TTL_MS) {
-            console.log("Serving sheet from server in-memory cache:", sheetUrl);
-            return NextResponse.json({ data: cachedEntry.data }, {
+    if (!bypassCache && cachedEntry && (now - cachedEntry.timestamp < CACHE_TTL_MS)) {
+        console.log("Serving sheet from server in-memory cache:", sheetUrl);
+        return NextResponse.json({ data: cachedEntry.data }, {
+            headers: {
+                'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=60',
+                'X-Cache': 'HIT-Server-Memory'
+            },
+        });
+    }
+
+    // Check file cache if not bypassing
+    if (!bypassCache) {
+        const fileCachedData = readCacheFile(sheetUrl);
+        if (fileCachedData) {
+            console.log("Serving sheet from server file cache:", sheetUrl);
+            cache.set(sheetUrl, { data: fileCachedData, timestamp: now });
+            return NextResponse.json({ data: fileCachedData }, {
                 headers: {
                     'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=60',
-                    'X-Cache': 'HIT-Server'
+                    'X-Cache': 'HIT-Server-Disk'
                 },
             });
         }
@@ -68,10 +120,7 @@ export async function GET(request) {
         const response = await fetch(fetchUrl, { cache: 'no-store' });
 
         if (!response.ok) {
-            return NextResponse.json(
-                { error: `Failed to fetch sheet: ${response.status} ${response.statusText}` },
-                { status: response.status }
-            );
+            throw new Error(`Failed to fetch sheet: ${response.status} ${response.statusText}`);
         }
 
         const csvText = await response.text();
@@ -85,11 +134,12 @@ export async function GET(request) {
             console.warn('CSV Parsing errors:', errors);
         }
 
-        // Store in memory cache
+        // Store in memory and file cache
         cache.set(sheetUrl, {
             data,
             timestamp: now
         });
+        writeCacheFile(sheetUrl, data);
 
         const headers = {
             'X-Cache': 'MISS-Server'
@@ -104,7 +154,40 @@ export async function GET(request) {
         return NextResponse.json({ data }, { headers });
     } catch (error) {
         console.error('Error fetching sheet:', error);
+
+        // STALE-ON-ERROR: Try to recover ANY cached data (even if expired)
+        let fallbackData = null;
+        let cacheSource = 'None';
+
+        if (cachedEntry) {
+            fallbackData = cachedEntry.data;
+            cacheSource = 'Memory-Expired';
+        } else {
+            try {
+                const filePath = getCacheFilePath(sheetUrl);
+                if (fs.existsSync(filePath)) {
+                    const content = fs.readFileSync(filePath, 'utf8');
+                    fallbackData = JSON.parse(content);
+                    cacheSource = 'Disk-Expired';
+                }
+            } catch (cacheErr) {
+                console.error('Failed to read expired file cache:', cacheErr);
+            }
+        }
+
+        if (fallbackData) {
+            console.warn(`Serving expired cached data (${cacheSource}) as fallback due to error:`, error.message);
+            return NextResponse.json({ data: fallbackData }, {
+                headers: {
+                    'Cache-Control': 'no-store',
+                    'X-Cache': `HIT-Stale-Fallback-${cacheSource}`,
+                    'X-Cache-Error': error.message
+                }
+            });
+        }
+
         return NextResponse.json({ error: error.message }, { status: 500 });
     }
 }
+
 

@@ -414,6 +414,36 @@ function computeVoicemailStats(rows) {
     };
 }
 
+const getLocalCache = (key) => {
+    if (typeof window === "undefined") return null;
+    try {
+        const item = localStorage.getItem(key);
+        if (!item) return null;
+        const parsed = JSON.parse(item);
+        const now = Date.now();
+        // Check if cached item has data and is still fresh (5 minutes)
+        if (parsed && parsed.timestamp && (now - parsed.timestamp < 5 * 60 * 1000)) {
+            return parsed.data;
+        }
+    } catch (err) {
+        console.error("Error reading client cache:", err);
+    }
+    return null;
+};
+
+const setLocalCache = (key, data) => {
+    if (typeof window === "undefined") return;
+    try {
+        const item = {
+            data,
+            timestamp: Date.now()
+        };
+        localStorage.setItem(key, JSON.stringify(item));
+    } catch (err) {
+        console.error("Error writing client cache:", err);
+    }
+};
+
 export default function Home() {
     const [data, setData] = useState([]);
     const [errorsData, setErrorsData] = useState([]);
@@ -432,6 +462,9 @@ export default function Home() {
     const [rankingModalOpen, setRankingModalOpen] = useState(false);
     const [errorsModalOpen, setErrorsModalOpen] = useState(false);
     const [activeTab, setActiveTab] = useState("dashboard");
+    const [mainCooldown, setMainCooldown] = useState(false);
+    const [errorsCooldown, setErrorsCooldown] = useState(false);
+
 
     // Filter State
     const [searchTerm, setSearchTerm] = useState("");
@@ -531,6 +564,30 @@ export default function Home() {
     const fetchData = async (url, bypassCache = false) => {
         const targetUrl = url || sheetUrl;
         if (!targetUrl) return;
+
+        const cacheKey = `sheet_data_${encodeURIComponent(targetUrl)}`;
+
+        if (bypassCache) {
+            setMainCooldown(true);
+            setTimeout(() => setMainCooldown(false), 10000);
+        } else {
+            const cached = getLocalCache(cacheKey);
+            if (cached) {
+                console.log("Serving sheet from client local storage:", targetUrl);
+                setData(cached);
+                if (typeof window !== "undefined") {
+                    try {
+                        const item = JSON.parse(localStorage.getItem(cacheKey));
+                        setLastUpdated(new Date(item.timestamp));
+                    } catch {
+                        setLastUpdated(new Date());
+                    }
+                }
+                setLoading(false);
+                return;
+            }
+        }
+
         setLoading(true);
         try {
             const cacheParam = bypassCache ? `&bypassCache=true&t=${Date.now()}` : '';
@@ -539,8 +596,10 @@ export default function Home() {
             if (jsonData.error) {
                 console.error("API Error:", jsonData.error);
             } else {
-                setData(Array.isArray(jsonData.data) ? jsonData.data : []);
+                const fetchedData = Array.isArray(jsonData.data) ? jsonData.data : [];
+                setData(fetchedData);
                 setLastUpdated(new Date());
+                setLocalCache(cacheKey, fetchedData);
             }
         } catch (error) {
             console.error("Failed to fetch data", error);
@@ -550,6 +609,29 @@ export default function Home() {
     };
 
     const fetchErrorsData = async (bypassCache = false) => {
+        const cacheKey = `sheet_data_${encodeURIComponent(ERRORS_SHEET_URL)}`;
+
+        if (bypassCache) {
+            setErrorsCooldown(true);
+            setTimeout(() => setErrorsCooldown(false), 10000);
+        } else {
+            const cached = getLocalCache(cacheKey);
+            if (cached) {
+                console.log("Serving errors from client local storage");
+                setErrorsData(cached);
+                if (typeof window !== "undefined") {
+                    try {
+                        const item = JSON.parse(localStorage.getItem(cacheKey));
+                        setErrorsLastUpdated(new Date(item.timestamp));
+                    } catch {
+                        setErrorsLastUpdated(new Date());
+                    }
+                }
+                setErrorsLoading(false);
+                return;
+            }
+        }
+
         setErrorsLoading(true);
         setErrorsFetchError(null);
         try {
@@ -560,8 +642,10 @@ export default function Home() {
                 console.error("Errors sheet API Error:", jsonData.error);
                 setErrorsFetchError(jsonData.error);
             } else {
-                setErrorsData(Array.isArray(jsonData.data) ? jsonData.data : []);
+                const fetchedData = Array.isArray(jsonData.data) ? jsonData.data : [];
+                setErrorsData(fetchedData);
                 setErrorsLastUpdated(new Date());
+                setLocalCache(cacheKey, fetchedData);
             }
         } catch (error) {
             console.error("Failed to fetch errors data", error);
@@ -572,6 +656,27 @@ export default function Home() {
     };
 
     const fetchVoicemailCount = async (bypassCache = false) => {
+        const cacheKey = `sheet_data_${encodeURIComponent(VOICEMAIL_SHEET_URL)}`;
+
+        if (!bypassCache) {
+            const cached = getLocalCache(cacheKey);
+            if (cached) {
+                console.log("Serving voicemail from client local storage");
+                setVoicemailRows(cached);
+                setVoicemailAccessError(null);
+                if (typeof window !== "undefined") {
+                    try {
+                        const item = JSON.parse(localStorage.getItem(cacheKey));
+                        setVoicemailLastUpdated(new Date(item.timestamp));
+                    } catch {
+                        setVoicemailLastUpdated(new Date());
+                    }
+                }
+                setVoicemailLoading(false);
+                return "ok";
+            }
+        }
+
         setVoicemailLoading(true);
         try {
             const cacheParam = bypassCache ? `&bypassCache=true&t=${Date.now()}` : '';
@@ -592,6 +697,7 @@ export default function Home() {
                 setVoicemailRows(rows);
                 setVoicemailAccessError(null);
                 setVoicemailLastUpdated(new Date());
+                setLocalCache(cacheKey, rows);
             }
         } catch (error) {
             console.error("Failed to fetch voicemail count", error);
@@ -610,6 +716,7 @@ export default function Home() {
         fetchData(sheetInputValue.trim());
         setSheetModalOpen(false);
     };
+
 
     const REVALIDATION_COOLDOWN = 5 * 60 * 1000; // 5 minutes
 
@@ -978,22 +1085,23 @@ export default function Home() {
                                 </button>
                                 <button
                                     onClick={() => fetchData(sheetUrl, true)}
-                                    disabled={!sheetUrl || loading}
+                                    disabled={!sheetUrl || loading || mainCooldown}
                                     className="flex items-center gap-2 px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/35 text-cyan-100 border border-cyan-300/35 rounded-lg transition-colors text-sm font-semibold glass-panel disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                     <RefreshCcw size={16} className={loading ? "animate-spin" : ""} />
-                                    Atualizar
+                                    {loading ? "Atualizando..." : mainCooldown ? "Aguarde..." : "Atualizar"}
                                 </button>
                             </>
                         ) : (
                             <button
                                 onClick={() => fetchErrorsData(true)}
-                                disabled={errorsLoading}
+                                disabled={errorsLoading || errorsCooldown}
                                 className="flex items-center gap-2 px-4 py-2 bg-red-500/15 hover:bg-red-500/25 text-red-100 border border-red-300/25 rounded-lg transition-colors text-sm font-semibold glass-panel disabled:opacity-50 disabled:cursor-not-allowed"
                             >
                                 <RefreshCcw size={16} className={errorsLoading ? "animate-spin" : ""} />
-                                Atualizar
+                                {errorsLoading ? "Atualizando..." : errorsCooldown ? "Aguarde..." : "Atualizar"}
                             </button>
+
                         )}
                     </div>
                 </header>
