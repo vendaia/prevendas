@@ -425,6 +425,7 @@ export default function Home() {
     const [voicemailAccessError, setVoicemailAccessError] = useState(null);
     const [loading, setLoading] = useState(false);
     const [lastUpdated, setLastUpdated] = useState(null);
+    const [voicemailLastUpdated, setVoicemailLastUpdated] = useState(null);
     const [sheetUrl, setSheetUrl] = useState(DEFAULT_SHEET_URL);
     const [sheetInputValue, setSheetInputValue] = useState(DEFAULT_SHEET_URL);
     const [sheetModalOpen, setSheetModalOpen] = useState(false);
@@ -527,12 +528,13 @@ export default function Home() {
         setModalOpen(true);
     };
 
-    const fetchData = async (url) => {
+    const fetchData = async (url, bypassCache = false) => {
         const targetUrl = url || sheetUrl;
         if (!targetUrl) return;
         setLoading(true);
         try {
-            const res = await fetch(`/api/sheets?url=${encodeURIComponent(targetUrl)}`);
+            const cacheParam = bypassCache ? `&bypassCache=true&t=${Date.now()}` : '';
+            const res = await fetch(`/api/sheets?url=${encodeURIComponent(targetUrl)}${cacheParam}`);
             const jsonData = await res.json();
             if (jsonData.error) {
                 console.error("API Error:", jsonData.error);
@@ -547,11 +549,12 @@ export default function Home() {
         }
     };
 
-    const fetchErrorsData = async () => {
+    const fetchErrorsData = async (bypassCache = false) => {
         setErrorsLoading(true);
         setErrorsFetchError(null);
         try {
-            const res = await fetch(`/api/sheets?url=${encodeURIComponent(ERRORS_SHEET_URL)}`);
+            const cacheParam = bypassCache ? `&bypassCache=true&t=${Date.now()}` : '';
+            const res = await fetch(`/api/sheets?url=${encodeURIComponent(ERRORS_SHEET_URL)}${cacheParam}`);
             const jsonData = await res.json();
             if (jsonData.error) {
                 console.error("Errors sheet API Error:", jsonData.error);
@@ -568,10 +571,11 @@ export default function Home() {
         }
     };
 
-    const fetchVoicemailCount = async () => {
+    const fetchVoicemailCount = async (bypassCache = false) => {
         setVoicemailLoading(true);
         try {
-            const res = await fetch(`/api/sheets?url=${encodeURIComponent(VOICEMAIL_SHEET_URL)}`);
+            const cacheParam = bypassCache ? `&bypassCache=true&t=${Date.now()}` : '';
+            const res = await fetch(`/api/sheets?url=${encodeURIComponent(VOICEMAIL_SHEET_URL)}${cacheParam}`);
             const jsonData = await res.json();
             if (res.status === 401 || res.status === 403) {
                 setVoicemailAccessError("A planilha de caixa postal exige acesso. Publique como 'Qualquer pessoa com o link' para contabilizar automaticamente.");
@@ -587,6 +591,7 @@ export default function Home() {
                 const rows = Array.isArray(jsonData.data) ? jsonData.data : [];
                 setVoicemailRows(rows);
                 setVoicemailAccessError(null);
+                setVoicemailLastUpdated(new Date());
             }
         } catch (error) {
             console.error("Failed to fetch voicemail count", error);
@@ -606,33 +611,50 @@ export default function Home() {
         setSheetModalOpen(false);
     };
 
+    const REVALIDATION_COOLDOWN = 5 * 60 * 1000; // 5 minutes
+
+    // Main data loading
     useEffect(() => {
         if (!sheetUrl) return;
         fetchData(sheetUrl);
-        const interval = setInterval(() => fetchData(sheetUrl), 30000);
-        return () => clearInterval(interval);
     }, [sheetUrl]);
 
+    // Errors sheet loading
     useEffect(() => {
         fetchErrorsData();
-        const interval = setInterval(fetchErrorsData, 30000);
-        return () => clearInterval(interval);
     }, []);
 
+    // Voicemail loading
     useEffect(() => {
-        let interval;
+        fetchVoicemailCount();
+    }, []);
 
-        const loadVoicemail = async () => {
-            const result = await fetchVoicemailCount();
-            if (result === "unauthorized" && interval) {
-                clearInterval(interval);
+    // Tab focus revalidation: fetch if visibility becomes visible and last fetch was > 5 minutes ago
+    useEffect(() => {
+        const handleVisibilityChange = () => {
+            if (document.visibilityState === "visible") {
+                const now = new Date();
+                
+                // Revalidate main data
+                if (sheetUrl && (!lastUpdated || now - lastUpdated > REVALIDATION_COOLDOWN)) {
+                    fetchData(sheetUrl);
+                }
+                
+                // Revalidate errors data
+                if (!errorsLastUpdated || now - errorsLastUpdated > REVALIDATION_COOLDOWN) {
+                    fetchErrorsData();
+                }
+                
+                // Revalidate voicemail data
+                if (!voicemailLastUpdated || now - voicemailLastUpdated > REVALIDATION_COOLDOWN) {
+                    fetchVoicemailCount();
+                }
             }
         };
 
-        loadVoicemail();
-        interval = setInterval(loadVoicemail, 30000);
-        return () => clearInterval(interval);
-    }, []);
+        document.addEventListener("visibilitychange", handleVisibilityChange);
+        return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+    }, [sheetUrl, lastUpdated, errorsLastUpdated, voicemailLastUpdated]);
 
     // Derived State: Filtered Data
     const filteredData = data.filter(item => {
@@ -955,7 +977,7 @@ export default function Home() {
                                     Conectar Planilha
                                 </button>
                                 <button
-                                    onClick={() => fetchData(sheetUrl)}
+                                    onClick={() => fetchData(sheetUrl, true)}
                                     disabled={!sheetUrl || loading}
                                     className="flex items-center gap-2 px-4 py-2 bg-cyan-500/20 hover:bg-cyan-500/35 text-cyan-100 border border-cyan-300/35 rounded-lg transition-colors text-sm font-semibold glass-panel disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
@@ -965,7 +987,7 @@ export default function Home() {
                             </>
                         ) : (
                             <button
-                                onClick={fetchErrorsData}
+                                onClick={() => fetchErrorsData(true)}
                                 disabled={errorsLoading}
                                 className="flex items-center gap-2 px-4 py-2 bg-red-500/15 hover:bg-red-500/25 text-red-100 border border-red-300/25 rounded-lg transition-colors text-sm font-semibold glass-panel disabled:opacity-50 disabled:cursor-not-allowed"
                             >
